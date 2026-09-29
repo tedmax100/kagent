@@ -1,0 +1,27 @@
+{
+  "environment": "web",
+  "format": "html",
+  "prefix": "https://storage.googleapis.com",
+  "mainga": "UA-49880327-14",
+  "updated": "2026-09-29T21:45:26+08:00",
+  "id": "kagent-fundamentals",
+  "duration": 142,
+  "title": "kagent 入門：原理、架構與生命週期",
+  "authors": "kagent",
+  "summary": "寫給新手的 kagent 入門：什麼是 Agent、整體架構、三大資源、各元件分工，以及從 YAML 到對話的完整生命週期",
+  "source": "kagent-fundamentals.md",
+  "theme": "",
+  "status": [
+    "published"
+  ],
+  "category": [
+    "kagent",
+    "kubernetes",
+    "architecture"
+  ],
+  "tags": [
+    "web"
+  ],
+  "feedback": "https://github.com/kagent-dev/kagent/issues",
+  "url": "kagent-fundamentals"
+}
