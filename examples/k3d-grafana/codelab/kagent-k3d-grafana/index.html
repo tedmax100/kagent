@@ -1,0 +1,412 @@
+
+<!doctype html>
+
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, minimum-scale=1.0, initial-scale=1.0, user-scalable=yes">
+  <meta name="theme-color" content="#4F7DC9">
+  <meta charset="UTF-8">
+  <title>在 k3d 上學 kagent 並用 Grafana 觀測</title>
+  <link rel="stylesheet" href="//fonts.googleapis.com/css?family=Source+Code+Pro:400|Roboto:400,300,400italic,500,700|Roboto+Mono">
+  <link rel="stylesheet" href="//fonts.googleapis.com/icon?family=Material+Icons">
+  <link rel="stylesheet" href="https://storage.googleapis.com/claat-public/codelab-elements.css">
+  <style>
+    .success {
+      color: #1e8e3e;
+    }
+    .error {
+      color: red;
+    }
+  </style>
+</head>
+<body>
+  <google-codelab-analytics gaid="UA-49880327-14" ga4id=""></google-codelab-analytics>
+  <google-codelab codelab-gaid=""
+                  codelab-ga4id=""
+                  id="kagent-k3d-grafana"
+                  title="在 k3d 上學 kagent 並用 Grafana 觀測"
+                  environment="web"
+                  feedback-link="https://github.com/kagent-dev/kagent/issues">
+    
+      <google-codelab-step label="開始之前" duration="5">
+        <h2 is-upgraded>你會學到什麼</h2>
+<ul>
+<li>kagent v1alpha3 的三個核心資源：<strong>Harness</strong>（怎麼跑）、<strong>AgentTemplate</strong>（做什麼）、<strong>Agent</strong>（兩者組合）</li>
+<li>讓代理透過 <strong>MCP</strong> 使用工具，並對危險操作要求<strong>人工核准</strong></li>
+<li>用 <strong>子代理（sub-agent）</strong> 組成值班 (on-call) 主管</li>
+<li>帶入你自己的 <strong>LangChain / LangGraph</strong> 代理（BYO）</li>
+<li>用 <strong>Grafana LGTM</strong>（Tempo / Loki / Prometheus）看到每一次代理呼叫的 trace、log、metrics</li>
+</ul>
+<h2 is-upgraded>你需要準備</h2>
+<ul>
+<li><code>docker</code>、<code>k3d</code> ≥ 5.8、<code>kubectl</code>、<code>helm</code> ≥ 3.14、<code>jq</code>、<code>openssl</code>、<code>curl</code></li>
+<li>約 6 GB 可用記憶體，以及足夠的磁碟空間</li>
+<li>一個模型：<code>OPENAI_API_KEY</code>、<code>ANTHROPIC_API_KEY</code>、<code>GOOGLE_API_KEY</code> 擇一；都沒設時會改用本機 Ollama</li>
+</ul>
+<p>Negative : 使用 1.5B 這類小模型只適合範例 1，工具呼叫不穩定。範例 2–4 請用雲端金鑰或 <code>qwen2.5:7b</code> 以上的本機模型。</p>
+<h2 is-upgraded>架構總覽</h2>
+<pre><code>                      k3d cluster &#34;kagent&#34; (k8s 1.35)
+ ┌──────────────────────────────────────────────────────────────────────┐
+ │ ns kagent                              ns ate-system (Substrate)     │
+ │  kagent-controller ── A2A :8083 ─────▶  ate-api / atelet / router    │
+ │  kagent-ui :8080                        WorkerPool kagent-default    │
+ │  kagent-tools (MCP: k8s_*)               └─ gVisor Actors = agents   │
+ │  kagent-grafana-mcp (MCP) ──┐                     │ OTLP             │
+ │  postgres                   │                     ▼                  │
+ │ ns observability            └────────▶  lgtm: Grafana :3000          │
+ │  (controller + agents ── OTLP :4317 ─▶        Tempo / Loki / Prom)   │
+ │ ns demo: web, api (crashloop), worker (bad image), loadgen           │
+ └──────────────────────────────────────────────────────────────────────┘
+</code></pre>
+<p>每個代理實際上跑在 Substrate 的 gVisor <strong>Actor</strong> 裡；controller 對外提供 A2A gateway，UI 與 <code>chat.sh</code> 都透過它和代理對話。</p>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="調整系統限制" duration="3">
+        <p>k3s 節點會使用 inotify。Ubuntu 預設值（128）在建立兩三個叢集後就會耗盡，新節點會卡在 <code>Waiting for containerd startup</code>（<code>too many open files</code>）。</p>
+<pre>sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=524288
+</pre>
+<p>永久生效：</p>
+<pre>printf &#39;fs.inotify.max_user_instances=1024\nfs.inotify.max_user_watches=524288\n&#39; \
+  | sudo tee /etc/sysctl.d/99-inotify.conf
+</pre>
+<p>Positive : k3d 節點看得到主機整顆磁碟。<code>up.sh</code> 已把 kubelet 的映像檔 GC 調低，避免磁碟快滿時映像被刪；空間要自己管理（<code>docker system df</code>）。</p>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="啟動叢集" duration="15">
+        <p>在 repo 根目錄執行：</p>
+<pre>export OPENAI_API_KEY=sk-...           # 選填
+./examples/k3d-grafana/up.sh           # 第一次約 10 分鐘（拉映像檔）
+</pre>
+<p>新開一個終端機，讓 port-forward 保持執行：</p>
+<pre>./examples/k3d-grafana/forward.sh
+</pre>
+<table>
+<tr><td colspan="1" rowspan="1"><p>URL</p>
+</td><td colspan="1" rowspan="1"><p>用途</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>http://localhost:8080</p>
+</td><td colspan="1" rowspan="1"><p>kagent UI</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>http://localhost:8083</p>
+</td><td colspan="1" rowspan="1"><p>controller：A2A gateway、gRPC-Web、<code>/mcp</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>http://localhost:3000</p>
+</td><td colspan="1" rowspan="1"><p>Grafana（admin / admin）</p>
+</td></tr>
+</table>
+<h2 is-upgraded>up.sh 幫你繞過的 k3d 問題</h2>
+<table>
+<tr><td colspan="1" rowspan="1"><p>問題</p>
+</td><td colspan="1" rowspan="1"><p>症狀</p>
+</td><td colspan="1" rowspan="1"><p>up.sh 的處理</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Substrate 需要 beta Kubernetes API</p>
+</td><td colspan="1" rowspan="1"><p>Pod 卡在 <code>ContainerCreating</code>（<code>podcertificate</code> volume）</p>
+</td><td colspan="1" rowspan="1"><p>k3s 1.35 並在 apiserver、controller-manager、kubelet 開 feature gates</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>磁碟 &gt;85% 時 kubelet 映像 GC</p>
+</td><td colspan="1" rowspan="1"><p>拉好的映像消失、一直拉不完</p>
+</td><td colspan="1" rowspan="1"><p><code>image-gc-high-threshold=99</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>連 ghcr.io 慢或不穩</p>
+</td><td colspan="1" rowspan="1"><p>helm <code>--wait</code> 逾時</p>
+</td><td colspan="1" rowspan="1"><p>用 <code>ctr</code> 平行預拉所有映像</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>atelet 自己抓代理映像，且只試一次</p>
+</td><td colspan="1" rowspan="1"><p><code>GoldenActorCrashed</code>、atelet log <code>PROTOCOL_ERROR</code></p>
+</td><td colspan="1" rowspan="1"><p>本機 registry <code>kagent-registry</code>（<code>localhost:5001</code>）+ <code>--localhost-registry-replacement</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>gVisor 無法在節點 overlayfs 上放 overlay</p>
+</td><td colspan="1" rowspan="1"><p><code>GoldenActorCrashed</code>、<code>not supported as upperdir</code></p>
+</td><td colspan="1" rowspan="1"><p>把 <code>/var/lib/ateom-gvisor</code> bind-mount 到 ext4 的 k3s volume</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>sandbox 的 DNS 不認得 <code>host.k3d.internal</code></p>
+</td><td colspan="1" rowspan="1"><p>模型呼叫 <code>no such host</code></p>
+</td><td colspan="1" rowspan="1"><p><code>ollama</code> Service 指向主機 gateway IP</p>
+</td></tr>
+</table>
+<p>Negative : bind mount 不會撐過節點重啟（<code>docker restart</code>、重開機）。重跑 <code>up.sh</code> 即可，它是冪等的。</p>
+<h2 is-upgraded>設定方便的別名</h2>
+<pre>alias k=&#39;kubectl --context k3d-kagent -n kagent&#39;
+alias chat=./examples/k3d-grafana/chat.sh
+</pre>
+<p>Positive : API group 是 <code>api.kagent.dev</code>。如果 kubectl 也認得舊版 <code>kagent.dev</code> 的 Agent，請改用完整名稱 <code>agents.api.kagent.dev</code>。</p>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="範例 1：hello，最小的 Agent" duration="10">
+        <p><code>up.sh</code> 已經替你建立好這個範例。先理解三個角色：</p>
+<ul>
+<li><strong>Harness</strong> = <em>怎麼</em>跑：runtime、映像 digest、WorkerPool、snapshot 位置</li>
+<li><strong>template</strong> = <em>做什麼</em>：模型、system prompt、工具</li>
+<li><strong>Agent</strong> = 一個 template + 一個 harness</li>
+</ul>
+<h2 is-upgraded>共用的 Harness</h2>
+<pre><code language="language-yaml" class="language-yaml">apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata:
+  name: kagent-go
+  namespace: kagent
+spec:
+  kagent: {}
+  workload:
+    image: localhost:5001/kagent-dev/kagent/golang-adk@sha256:...   # Substrate 要求 digest
+  substrate:
+    workerPoolRef:
+      name: kagent-default
+    snapshotPolicy:
+      location: s3://ate-snapshots/kagent
+</code></pre>
+<h2 is-upgraded>最小的 Agent（inline template）</h2>
+<pre><code language="language-yaml" class="language-yaml">apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: hello
+  namespace: kagent
+spec:
+  template:
+    modelConfig:
+      name: default-model-config
+    description: A friendly general-purpose assistant.
+    systemPrompt: |
+      You are a concise, friendly assistant running on kagent inside a local k3d cluster.
+  harnessRef:
+    name: kagent-go
+</code></pre>
+<h2 is-upgraded>動手玩</h2>
+<pre>k get harnesses,agents
+k get agent hello -o jsonpath=&#34;{.status}&#34; | jq
+chat hello &#34;Hi, introduce yourself in one sentence&#34;
+</pre>
+<p><code>chat.sh</code> 會印出 <code>CONTEXT=...</code>。帶上它就是同一段對話：</p>
+<pre>CONTEXT=&lt;印出的 contextId&gt; chat hello &#34;What did I just ask you?&#34;
+</pre>
+<h2 is-upgraded>試試看</h2>
+<ol type="1">
+<li>修改 <code>systemPrompt</code> 後再 <code>k apply</code>。觀察 status 裡的 <code>desiredRevision</code> / <code>latestSuccessfulRevision</code>：每次變更都會產生新的不可變 revision（Substrate 啟動 golden actor 並做 snapshot）。既有對話會固定在舊 revision，新對話才用新的。</li>
+<li>看 Substrate 背後的物件：</li>
+</ol>
+<pre>k -n ate-system get actortemplates
+k get workerpools
+</pre>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="範例 2：K8s 疑難排解（MCP 工具與核准）" duration="15">
+        <h2 is-upgraded>部署故障工作負載與代理</h2>
+<pre>kubectl --context k3d-kagent apply -f examples/k3d-grafana/manifests/demo/broken-apps.yaml
+k apply -f examples/k3d-grafana/manifests/02-k8s-agent.yaml
+k get agent k8s-troubleshooter -w          # 等 Ready=True
+</pre>
+<h2 is-upgraded>工具分兩組綁定</h2>
+<pre><code language="language-yaml" class="language-yaml">tools:
+- mcp:                         # 唯讀工具：直接執行
+    server: {kind: RemoteMCPServer, name: kagent-tool-server}
+    tools: [k8s_get_resources, k8s_describe_resource, k8s_get_events,
+            k8s_get_pod_logs, k8s_get_resource_yaml]
+- mcp:                         # 會改動叢集：需要人工核准
+    server: {kind: RemoteMCPServer, name: kagent-tool-server}
+    requireApproval: true
+    tools: [k8s_patch_resource, k8s_scale, k8s_rollout, k8s_delete_resource]
+</code></pre>
+<p>Positive : <code>AgentTemplate</code> 是獨立資源，Agent 用 <code>templateRef</code> 引用。這也讓範例 4 可以把它當子代理重用。</p>
+<h2 is-upgraded>提問</h2>
+<pre>chat k8s-troubleshooter &#34;Which pods in namespace demo are unhealthy, and why?&#34;
+</pre>
+<h2 is-upgraded>體驗人工核准</h2>
+<p>在 <strong>UI</strong>（http://localhost:8080）向 <code>k8s-troubleshooter</code> 說：</p>
+<p>Fix the worker deployment&#39;s image tag to nginx:1.27-alpine</p>
+<p>代理會在 patch 之前停下（A2A 狀態 <code>input-required</code>），等你按 <strong>Approve</strong> 或 <strong>Reject</strong>。</p>
+<h2 is-upgraded>查看 MCP server 提供的所有工具</h2>
+<pre>k get remotemcpservers kagent-tool-server -o jsonpath=&#39;{.status.discoveredTools[*].name}&#39;
+</pre>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="範例 3：Grafana 分析師" duration="10">
+        <p><code>up.sh</code> 已建立 Grafana service account token，並讓 chart 的 <code>kagent-grafana-mcp</code> 指向 LGTM。<code>broken-apps.yaml</code> 內的 <code>loadgen</code> 會持續送出 OTLP traces、logs、metrics。</p>
+<pre>k apply -f examples/k3d-grafana/manifests/03-grafana-agent.yaml
+chat grafana-analyst &#34;Which Prometheus and Loki datasources are available?&#34;
+chat grafana-analyst &#34;How many error logs did service checkout emit in the last 10 minutes? What does a typical one say?&#34;
+chat grafana-analyst &#34;What is the p95 latency of the spans for service checkout? Show the PromQL you used.&#34;
+</pre>
+<p>Positive : 若最後一題找不到 metrics，請它先列出名稱含 <code>traces_span</code> 或 <code>duration</code> 的 metric。這些名稱取決於 LGTM 從 span 產生的 metric，自己摸索出來本身就是很好的練習。</p>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="範例 4：值班主管與子代理" duration="10">
+        <pre>k apply -f examples/k3d-grafana/manifests/04-oncall-agent.yaml
+chat oncall &#34;Users report checkout is failing. Triage namespace demo and the checkout service.&#34;
+</pre>
+<p><code>oncall</code> 不直接碰工具，而是委派：</p>
+<pre><code language="language-yaml" class="language-yaml">tools:
+- subAgent:
+    name: kubernetes
+    description: Inspects pods, events and logs in the cluster.
+    templateRef: {name: k8s-troubleshooter}
+- subAgent:
+    name: observability
+    description: Queries Prometheus metrics and Loki logs through Grafana.
+    templateRef: {name: grafana-analyst}
+</code></pre>
+<ul>
+<li><code>subAgent.templateRef</code> 重用範例 2、3 的 template。</li>
+<li>它們以 Shared 子代理的身分跑在 oncall 的 actor 內，不需要額外的 Agent。</li>
+<li>到 Grafana → Explore → Tempo 可以看到父層 <code>invoke_agent</code> span，底下每次委派各有一個子 <code>invoke_agent</code> span。</li>
+</ul>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="範例 5：BYO LangGraph 代理" duration="20">
+        <p><a href="https://github.com/kagent-dev/kagent/tree/main/examples/k3d-grafana/byo-langgraph" target="_blank"><code>byo-langgraph/</code></a> 是一個普通的 LangGraph ReAct 代理（<code>agent.py</code> 內有三個 Python 工具），由 <code>server.py</code> 包裝成 Substrate 能執行的形式。Harness 使用 <code>byo: {}</code> 取代 kagent runtime；AgentTemplate 仍提供模型與 system prompt，所以這兩者可以用 <code>kubectl apply</code> 修改，工具則是程式碼。</p>
+<pre>./examples/k3d-grafana/byo-langgraph/build.sh     # build、推到 kagent-registry、固定 digest
+k apply -f examples/k3d-grafana/manifests/05-byo-langgraph.yaml
+chat langgraph-helper &#34;現在台北幾點？幫我算 (1234 * 5.5) / 3，再擲兩顆骰子&#34;
+CONTEXT=&lt;印出的 id&gt; chat langgraph-helper &#34;剛剛骰子加起來是多少？&#34;
+</pre>
+<p>第二題能答對，代表記憶在 actor 暫停 (suspend) 後仍然存在。</p>
+<h2 is-upgraded>BYO 映像在 Substrate 上必須做到</h2>
+<table>
+<tr><td colspan="1" rowspan="1"><p>需求</p>
+</td><td colspan="1" rowspan="1"><p>原因</p>
+</td><td colspan="1" rowspan="1"><p>位置</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>在 <code>:80</code> 提供 A2A over gRPC</p>
+</td><td colspan="1" rowspan="1"><p>gateway 會連到這裡</p>
+</td><td colspan="1" rowspan="1"><p><code>server.py</code> <code>grpc_lifespan</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p><code>:8081</code> 提供 <code>GET /readyz</code>，且必須在 <code>:80</code> 開始監聽之後</p>
+</td><td colspan="1" rowspan="1"><p>Substrate 一收到回應就做 snapshot</p>
+</td><td colspan="1" rowspan="1"><p><code>server.py</code> <code>readiness_lifespan</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>用 <code>KAgentTaskStore</code>（<code>KAGENT_API_URL</code>）存 task 狀態</p>
+</td><td colspan="1" rowspan="1"><p>歷史、核准、暫停都需要</p>
+</td><td colspan="1" rowspan="1"><p><code>server.py</code> <code>build_app</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Harness 要有 <code>workload.command</code></p>
+</td><td colspan="1" rowspan="1"><p>沒有的話 API 會拒絕 BYO Harness</p>
+</td><td colspan="1" rowspan="1"><p><code>05-byo-langgraph.yaml</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>bookworm + uv 管理的 CPython</p>
+</td><td colspan="1" rowspan="1"><p>其他 Python 在 gVisor restore 會 crash</p>
+</td><td colspan="1" rowspan="1"><p><code>Dockerfile</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>async checkpointer（<code>InMemorySaver</code>）</p>
+</td><td colspan="1" rowspan="1"><p>executor 用 <code>astream</code>；<code>SqliteSaver</code> 只支援同步</p>
+</td><td colspan="1" rowspan="1"><p><code>agent.py</code></p>
+</td></tr>
+</table>
+<p>Negative : 1.0.0-alpha5 的粗糙處：<code>kagent-langgraph</code> 的 <code>KAgentApp</code> 只提供 HTTP JSON-RPC（沒有 gRPC、沒有 <code>/readyz</code>），所以 <code>server.py</code> 參考 <code>kagent-adk</code> 自建 listener；PyPI 上的 <code>kagent-core==1.0.0a5</code> 依賴不在 PyPI 的 <code>kagent-proto</code>，所以 <code>build.sh</code> 從此 checkout 建三個 SDK wheel；<code>import kagent.core</code> 需要 <code>openai</code> 但沒有宣告。</p>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="在 Grafana 觀測代理" duration="15">
+        <p><code>up.sh</code> 已開啟 kagent 的 OTel 匯出（<code>otel.traces/metrics/logs.enabled</code>），並設定 <code>otel.capture.messageContent=true</code>，因此 prompt 與回應都會出現在 span 裡。</p>
+<p>Negative : 本機示範可以這樣做，正式環境請不要開啟 message content 擷取。</p>
+<p>打開 Grafana（http://localhost:3000，admin / admin）→ <strong>Explore</strong>：</p>
+<table>
+<tr><td colspan="1" rowspan="1"><p>資料源</p>
+</td><td colspan="1" rowspan="1"><p>查詢</p>
+</td><td colspan="1" rowspan="1"><p>你會看到</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Tempo</p>
+</td><td colspan="1" rowspan="1"><p><code>{ resource.service.name = "hello" }</code></p>
+</td><td colspan="1" rowspan="1"><p>單一代理的 trace：<code>a2a.request</code> → <code>invoke_agent</code> → 模型 / 工具呼叫</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Tempo</p>
+</td><td colspan="1" rowspan="1"><p><code>{ span.gen_ai.operation.name = "invoke_agent" }</code></p>
+</td><td colspan="1" rowspan="1"><p>所有代理呼叫。打開 oncall 的 trace 看父 → 子代理樹</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Tempo</p>
+</td><td colspan="1" rowspan="1"><p><code>{ resource.service.name = "kagent-controller" }</code></p>
+</td><td colspan="1" rowspan="1"><p>controller 端：gateway、gRPC</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Tempo</p>
+</td><td colspan="1" rowspan="1"><p><code>{ span.gen_ai.usage.input_tokens > 0 }</code></p>
+</td><td colspan="1" rowspan="1"><p>有 token 用量的推論 span</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Loki</p>
+</td><td colspan="1" rowspan="1"><p><code>{service_name="kagent-controller"}</code></p>
+</td><td colspan="1" rowspan="1"><p>controller 的 JSON log，內含 <code>trace_id</code>，可直接跳到 Tempo</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Prometheus</p>
+</td><td colspan="1" rowspan="1"><p><code>histogram_quantile(0.95, sum by (le, rpc_method) (rate(rpc_server_call_duration_seconds_bucket[5m])))</code></p>
+</td><td colspan="1" rowspan="1"><p>controller gRPC 延遲</p>
+</td></tr>
+</table>
+<h2 is-upgraded>練習</h2>
+<p>在 Grafana 用 TraceQL metrics 建一個小 dashboard，顯示每個代理的 <code>invoke_agent</code> 次數與平均時間：</p>
+<pre><code>{ span.gen_ai.operation.name = &#34;invoke_agent&#34; } | rate() by (resource.service.name)
+</code></pre>
+<p>然後請 <code>grafana-analyst</code> 用 <code>search_dashboards</code> 找到它。</p>
+<p>Positive : span 屬性的定義見 <code>docs/architecture/telemetry.md</code> 與 <code>telemetry-contract.md</code>。</p>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="疑難排解" duration="5">
+        <table>
+<tr><td colspan="1" rowspan="1"><p>症狀</p>
+</td><td colspan="1" rowspan="1"><p>檢查</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Agent 一直 <code>Ready=False</code></p>
+</td><td colspan="1" rowspan="1"><p><code>k get agent X -o yaml</code> 看 conditions；<code>k logs deploy/kagent-controller</code>；<code>k -n ate-system get actortemplates</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>對話卡住後 504</p>
+</td><td colspan="1" rowspan="1"><p>actor 一直沒 ready：<code>k -n ate-system logs ds/atelet</code>；<code>k get workerpools</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>工具呼叫失敗</p>
+</td><td colspan="1" rowspan="1"><p><code>k get remotemcpservers</code> 看 Accepted condition；<code>k logs deploy/kagent-grafana-mcp</code> 或 <code>deploy/kagent-tools</code></p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>模型呼叫失敗（Ollama）</p>
+</td><td colspan="1" rowspan="1"><p>在主機執行 <code>curl localhost:11434/api/tags</code>，確認模型已 pull</p>
+</td></tr>
+<tr><td colspan="1" rowspan="1"><p>Grafana MCP 401</p>
+</td><td colspan="1" rowspan="1"><p>token 產生在已重啟的 LGTM pod（emptyDir）。重跑 <code>up.sh</code></p>
+</td></tr>
+</table>
+
+
+      </google-codelab-step>
+    
+      <google-codelab-step label="清理與下一步" duration="2">
+        <pre>./examples/k3d-grafana/down.sh
+</pre>
+<p>這會刪除整個叢集。</p>
+<h2 is-upgraded>你完成了</h2>
+<ul>
+<li>用 Harness + AgentTemplate + Agent 描述代理</li>
+<li>用 MCP 工具與 <code>requireApproval</code> 控制風險</li>
+<li>用子代理組合專家</li>
+<li>帶入自己的 LangGraph 代理</li>
+<li>在 Grafana 追蹤整條呼叫鏈</li>
+</ul>
+<h2 is-upgraded>延伸閱讀</h2>
+<ul>
+<li><a href="https://github.com/kagent-dev/kagent/tree/main/docs/architecture" target="_blank">kagent 架構文件</a></li>
+<li><a href="https://github.com/grafana/docker-otel-lgtm" target="_blank">Grafana LGTM</a></li>
+</ul>
+
+
+      </google-codelab-step>
+    
+  </google-codelab>
+
+  <script src="https://storage.googleapis.com/claat-public/native-shim.js"></script>
+  <script src="https://storage.googleapis.com/claat-public/custom-elements.min.js"></script>
+  <script src="https://storage.googleapis.com/claat-public/prettify.js"></script>
+  <script src="https://storage.googleapis.com/claat-public/codelab-elements.js"></script>
+  <script src="//support.google.com/inapp/api.js"></script>
+
+</body>
+</html>

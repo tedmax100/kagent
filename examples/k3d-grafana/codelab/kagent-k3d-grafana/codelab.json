@@ -1,0 +1,27 @@
+{
+  "environment": "web",
+  "format": "html",
+  "prefix": "https://storage.googleapis.com",
+  "mainga": "UA-49880327-14",
+  "updated": "2026-09-29T21:30:35+08:00",
+  "id": "kagent-k3d-grafana",
+  "duration": 110,
+  "title": "在 k3d 上學 kagent 並用 Grafana 觀測",
+  "authors": "kagent",
+  "summary": "在本機 k3d 叢集上，從零學會 kagent 的 Harness / AgentTemplate / Agent、MCP 工具、人工核准、子代理、BYO LangGraph，並用 Grafana LGTM 觀測代理",
+  "source": "kagent-k3d-grafana.md",
+  "theme": "",
+  "status": [
+    "published"
+  ],
+  "category": [
+    "kagent",
+    "kubernetes",
+    "observability"
+  ],
+  "tags": [
+    "web"
+  ],
+  "feedback": "https://github.com/kagent-dev/kagent/issues",
+  "url": "kagent-k3d-grafana"
+}
